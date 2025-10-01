@@ -37,7 +37,7 @@ colmap feature_extractor \
   --database_path "$COLMAP_DIR/database.db" \
   --image_path "$VIEW_DIR" \
   --ImageReader.single_camera 1 \
-  --SiftExtraction.use_gpu 1
+  --SiftExtraction.use_gpu 0
 
 colmap exhaustive_matcher \
   --database_path "$COLMAP_DIR/database.db" \
