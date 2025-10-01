@@ -30,6 +30,9 @@ echo "[StageBuild Splat] Running COLMAP SfM..."
 cd "$OUT_DIR"
 touch "$COLMAP_DIR/database.db"
 
+# Run COLMAP headless (no Qt display required)
+export QT_QPA_PLATFORM=offscreen
+
 colmap feature_extractor \
   --database_path "$COLMAP_DIR/database.db" \
   --image_path "$VIEW_DIR" \
