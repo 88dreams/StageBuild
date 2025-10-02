@@ -42,10 +42,14 @@ RUN git clone https://github.com/cvlab-columbia/zero123.git && \
     git rev-parse HEAD && \
     cd ..
 
-# Scripts
+# Scripts (copy as root, set perms, then chown back)
+USER root
+RUN mkdir -p /workspace/scripts
 COPY scripts/generate_views_zero123.py /workspace/scripts/generate_views_zero123.py
 COPY scripts/setup_zero123_weights.sh /workspace/scripts/setup_zero123_weights.sh
-RUN chmod +x /workspace/scripts/*.py /workspace/scripts/*.sh
+RUN chmod 755 /workspace/scripts/*.py /workspace/scripts/*.sh && \
+    chown -R ${USERNAME}:${USERNAME} /workspace/scripts
+USER ${USERNAME}
 
 # Data dirs (will be symlinked to /data by Start Command)
 RUN mkdir -p /workspace/input /workspace/output /workspace/checkpoints
