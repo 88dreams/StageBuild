@@ -41,7 +41,7 @@ colmap feature_extractor \
 
 colmap exhaustive_matcher \
   --database_path "$COLMAP_DIR/database.db" \
-  --SiftMatching.use_gpu 1
+  --SiftMatching.use_gpu 0
 
 colmap mapper \
   --database_path "$COLMAP_DIR/database.db" \
