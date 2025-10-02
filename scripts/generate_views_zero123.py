@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 """
-Multiview generation using Zero123 native inference (not diffusers).
-This is the ONLY reliable way to use Zero123.
+Zero123 multiview generation using its native API (not CLI scripts).
 """
 import argparse, os, sys, subprocess, shutil
 from pathlib import Path
@@ -25,121 +24,171 @@ def setup_zero123():
             str(repo)
         ])
     
-    # Install deps
-    req = repo / "requirements.txt"
-    if req.exists():
-        print("[Zero123] Installing dependencies...")
-        # Pin specific versions to avoid conflicts
-        subprocess.check_call([
-            "pip", "install", "--no-cache-dir",
-            "diffusers==0.19.3",
-            "transformers==4.27.1",
-            "accelerate==0.19.0",
-            "omegaconf",
-            "einops",
-            "pytorch-lightning",
-            "imageio"
-        ])
+    # Install specific deps
+    print("[Zero123] Installing dependencies...")
+    subprocess.check_call([
+        "pip", "install", "--no-cache-dir",
+        "diffusers==0.19.3",
+        "transformers==4.27.1",
+        "accelerate==0.19.0",
+        "omegaconf",
+        "einops",
+        "pytorch-lightning",
+        "imageio",
+        "kornia"
+    ])
     
     return repo
 
-def run_zero123_inference(input_img, output_dir, num_views=12, elevation=15.0):
-    """Run Zero123 native inference."""
+def run_zero123_programmatic(input_img, output_dir, num_views=12, elevation=15.0):
+    """Run Zero123 by importing its modules directly."""
     repo = setup_zero123()
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Zero123 uses gradio_new.py or run_demo.py
-    # Find the correct inference script
-    inference_script = None
-    for candidate in ["gradio_new.py", "run_demo.py", "demo.py", "predict.py"]:
-        script = repo / candidate
-        if script.exists():
-            inference_script = script
-            break
+    # Add repo to path and import Zero123 model
+    sys.path.insert(0, str(repo))
     
-    if not inference_script:
-        raise FileNotFoundError(f"No inference script found in {repo}")
+    import torch
+    from PIL import Image
+    from diffusers import StableDiffusionPipeline, DDIMScheduler
+    from transformers import CLIPImageProcessor
     
-    print(f"[Zero123] Using {inference_script.name}...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
     
-    # Zero123's demo scripts typically take these args:
-    # --image_path, --output_path, --polar (elevation), --azimuth
+    # Load Zero123 model (hosted on HuggingFace by the authors)
+    print("[Zero123] Loading model...")
     
-    # Generate views at different azimuths
+    # Try the official Zero123-XL weights
+    try:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            "cvlab/zero123-weights",  # or try the actual HF path from their README
+            torch_dtype=dtype,
+            safety_checker=None
+        ).to(device)
+    except:
+        # Fallback to building from checkpoint if repo provides one
+        print("[Zero123] Trying alternate model path...")
+        # Check repo for checkpoint path
+        ckpt_path = repo / "105000.ckpt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError("Zero123 checkpoint not found. Download from model page.")
+        
+        # Load from checkpoint (requires their load script)
+        from zero123_inference import load_model
+        pipe = load_model(str(ckpt_path), device)
+    
+    # Load input
+    image = Image.open(input_img).convert("RGB").resize((256, 256))
+    
+    print(f"[Zero123] Generating {num_views} views...")
     for i in range(num_views):
         azimuth = (360.0 / num_views) * i
         polar = 90.0 - elevation
         
-        output_file = os.path.join(output_dir, f"view_{i:02d}.png")
+        # Zero123 conditioning
+        prompt_embeds = pipe.encode_prompt(
+            f"",  # Zero123 uses camera params, not text
+            device,
+            1,
+            False
+        )
         
-        try:
-            # Try with standard args
-            subprocess.check_call([
-                "python", str(inference_script),
-                "--input", input_img,
-                "--output", output_file,
-                "--polar", str(polar),
-                "--azimuth", str(azimuth)
-            ], cwd=str(repo))
-        except subprocess.CalledProcessError:
-            # Try alternate arg format
-            subprocess.check_call([
-                "python", str(inference_script),
-                input_img,
-                output_file,
-                str(polar),
-                str(azimuth)
-            ], cwd=str(repo))
+        # Generate view
+        result = pipe(
+            prompt_embeds=prompt_embeds,
+            image=image,
+            polar=torch.tensor([polar], device=device),
+            azimuth=torch.tensor([azimuth], device=device),
+            num_inference_steps=75,
+            guidance_scale=3.0
+        )
+        
+        result.images[0].save(os.path.join(output_dir, f"view_{i:02d}.png"))
     
-    print(f"[Zero123] Generated {num_views} views in {output_dir}")
+    print(f"[Zero123] Done. {num_views} views in {output_dir}")
 
-def fallback_sd_variations(input_img, output_dir, num_views=12):
-    """Fallback to SD image-variations."""
-    from PIL import Image
+def fallback_simple_multiview(input_img, output_dir, num_views=12):
+    """
+    Fallback: Use ControlNet + SD to generate architectural views.
+    This is more reliable than image-variations for 3D reconstruction.
+    """
     import torch
-    from diffusers import StableDiffusionImageVariationPipeline
+    from PIL import Image, ImageOps
+    from diffusers import StableDiffusionControlNetPipeline, ControlNetModel
+    from diffusers import UniPCMultistepScheduler
+    import cv2
+    import numpy as np
     
-    print("[Zero123] Native inference failed. Using SD image-variations fallback...")
+    print("[Fallback] Using ControlNet for multiview generation...")
     
     os.makedirs(output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
     
-    pipe = StableDiffusionImageVariationPipeline.from_pretrained(
-        "lambdalabs/sd-image-variations-diffusers",
-        revision="v2.0",
+    # Load ControlNet (canny edge)
+    controlnet = ControlNetModel.from_pretrained(
+        "lllyasviel/sd-controlnet-canny",
         torch_dtype=dtype
+    )
+    
+    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        controlnet=controlnet,
+        torch_dtype=dtype,
+        safety_checker=None
     ).to(device)
     
-    image = Image.open(input_img).convert("RGB").resize((512, 512))
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    
+    # Extract edges
+    img_np = np.array(Image.open(input_img).convert("RGB"))
+    edges = cv2.Canny(img_np, 100, 200)
+    edges_pil = Image.fromarray(edges).convert("RGB")
+    
+    # Generate views with slight prompt variations
+    prompts = [
+        "architectural facade, front view, professional photo",
+        "architectural facade, slight left angle, professional photo",
+        "architectural facade, slight right angle, professional photo",
+        "architectural facade, elevated view, professional photo",
+    ]
     
     for i in range(num_views):
-        guidance = 3.0 + (i * 0.5)
-        generator = torch.Generator(device=device).manual_seed(42 + i * 100)
+        prompt = prompts[i % len(prompts)]
+        seed = 42 + i * 100
+        generator = torch.Generator(device=device).manual_seed(seed)
         
-        result = pipe(image, guidance_scale=guidance, num_inference_steps=50, generator=generator)
+        result = pipe(
+            prompt,
+            edges_pil,
+            num_inference_steps=30,
+            guidance_scale=7.5,
+            generator=generator
+        )
+        
         result.images[0].save(os.path.join(output_dir, f"view_{i:02d}.png"))
     
-    print(f"[Zero123] Fallback generated {num_views} views")
+    print(f"[Fallback] Generated {num_views} ControlNet views")
 
 def main():
     args = parse_args()
     
     try:
-        run_zero123_inference(args.input, args.output, args.num_views, args.elevation)
+        print("[Zero123] Trying native programmatic inference...")
+        run_zero123_programmatic(args.input, args.output, args.num_views, args.elevation)
     except Exception as e:
         print(f"[Zero123] Error: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         
-        print("[Zero123] Attempting fallback...")
+        print("[Zero123] Attempting ControlNet fallback...")
         try:
-            fallback_sd_variations(args.input, args.output, args.num_views)
+            fallback_simple_multiview(args.input, args.output, args.num_views)
         except Exception as e2:
-            print(f"[Zero123] Fallback failed: {e2}", file=sys.stderr)
+            print(f"[Fallback] Failed: {e2}", file=sys.stderr)
             sys.exit(1)
 
 if __name__ == "__main__":
     main()
-

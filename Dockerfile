@@ -42,7 +42,7 @@ RUN git clone https://github.com/TencentARC/InstantMesh.git && \
 RUN git clone https://github.com/VAST-AI-Research/TripoSR.git && \
     pip install -r TripoSR/requirements.txt || true
 
-# Diffusers-based fallback for Zero123Plus when .pth is unavailable
+# Diffusers + deps for multiview generation
 RUN pip install --no-cache-dir \
     diffusers==0.30.0 \
     transformers==4.44.2 \
@@ -50,7 +50,11 @@ RUN pip install --no-cache-dir \
     safetensors==0.4.5 \
     Pillow==10.4.0 \
     huggingface_hub==0.35.3 \
-    boto3==1.35.36
+    boto3==1.35.36 \
+    opencv-python==4.10.0.84 \
+    omegaconf==2.3.0 \
+    einops==0.8.0 \
+    kornia==0.7.3
 
 # TripoSR runtime deps that require compilation (needs CUDA devel image)
 RUN pip install --no-cache-dir \
