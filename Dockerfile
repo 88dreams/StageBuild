@@ -72,6 +72,7 @@ COPY scripts/pipeline.sh /workspace/scripts/pipeline.sh
 COPY scripts/pipeline_splat.sh /workspace/scripts/pipeline_splat.sh
 COPY scripts/generate_views_diffusers.py /workspace/scripts/generate_views_diffusers.py
 COPY scripts/generate_views_stable.py /workspace/scripts/generate_views_stable.py
+COPY scripts/generate_views_zero123.py /workspace/scripts/generate_views_zero123.py
 COPY scripts/meshpush.py /workspace/scripts/meshpush.py
 COPY entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/scripts/*.sh /workspace/scripts/*.py /workspace/entrypoint.sh

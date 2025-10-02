@@ -16,11 +16,12 @@ echo "[StageBuild Splat] Output dir: $OUT_DIR"
 VIEW_DIR="$OUT_DIR/views"
 mkdir -p "$VIEW_DIR"
 
-echo "[StageBuild Splat] Generating multiviews with Stable-Zero123..."
-python /workspace/scripts/generate_views_stable.py \
+echo "[StageBuild Splat] Generating multiviews with Zero123..."
+python /workspace/scripts/generate_views_zero123.py \
   --input "$INPUT_IMG" \
   --output "$VIEW_DIR" \
-  --num_views 12
+  --num_views 12 \
+  --elevation 15.0
 
 # 2) COLMAP: recover camera poses from the multiviews
 COLMAP_DIR="$OUT_DIR/colmap"
