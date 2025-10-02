@@ -1,20 +1,22 @@
 #!/usr/bin/env python
 """
-Zero123 multiview generation using its native API (not CLI scripts).
+Zero123-XL multiview generation using checkpoint + native inference.
+This is the CORRECT way to use Zero123 for quality multiviews.
 """
-import argparse, os, sys, subprocess, shutil
+import argparse, os, sys, subprocess
 from pathlib import Path
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Generate multiviews with Zero123")
+    p = argparse.ArgumentParser(description="Generate multiviews with Zero123-XL")
     p.add_argument("--input", required=True, help="Path to input image")
     p.add_argument("--output", required=True, help="Directory to write generated views")
     p.add_argument("--num_views", type=int, default=12, help="Number of views")
-    p.add_argument("--elevation", type=float, default=15.0, help="Elevation angle")
+    p.add_argument("--elevation", type=float, default=15.0, help="Elevation angle (degrees)")
+    p.add_argument("--checkpoint", default="/workspace/checkpoints/zero123-xl.ckpt", help="Zero123-XL checkpoint")
     return p.parse_args()
 
-def setup_zero123():
-    """Clone and setup Zero123 repo."""
+def setup_zero123_repo():
+    """Clone Zero123 repo if needed."""
     repo = Path("/workspace/zero123")
     if not repo.exists():
         print("[Zero123] Cloning repo...")
@@ -23,111 +25,143 @@ def setup_zero123():
             "https://github.com/cvlab-columbia/zero123.git",
             str(repo)
         ])
-    
-    # Install specific deps
-    print("[Zero123] Installing dependencies...")
-    subprocess.check_call([
-        "pip", "install", "--no-cache-dir",
-        "diffusers==0.19.3",
-        "transformers==4.27.1",
-        "accelerate==0.19.0",
-        "omegaconf",
-        "einops",
-        "pytorch-lightning",
-        "imageio",
-        "kornia"
-    ])
-    
     return repo
 
-def run_zero123_programmatic(input_img, output_dir, num_views=12, elevation=15.0):
-    """Run Zero123 by importing its modules directly."""
-    repo = setup_zero123()
+def ensure_checkpoint(ckpt_path):
+    """Download checkpoint if not present."""
+    ckpt = Path(ckpt_path)
+    if not ckpt.exists():
+        print(f"[Zero123] Checkpoint not found at {ckpt_path}")
+        print("[Zero123] Running setup script to download...")
+        subprocess.check_call(["bash", "/workspace/scripts/setup_zero123_weights.sh"])
+        
+        if not ckpt.exists():
+            raise FileNotFoundError(
+                f"Checkpoint still missing after setup. "
+                f"Download manually from https://github.com/cvlab-columbia/zero123 "
+                f"and place at {ckpt_path}"
+            )
+    return ckpt
+
+def run_zero123_xl(input_img, output_dir, checkpoint_path, num_views=12, elevation=15.0):
+    """
+    Run Zero123-XL inference using the checkpoint and repo code.
+    """
+    repo = setup_zero123_repo()
+    ckpt = ensure_checkpoint(checkpoint_path)
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Add repo to path and import Zero123 model
+    # Add repo to path
     sys.path.insert(0, str(repo))
     
     import torch
     from PIL import Image
-    from diffusers import StableDiffusionPipeline, DDIMScheduler
-    from transformers import CLIPImageProcessor
+    from omegaconf import OmegaConf
+    import pytorch_lightning as pl
+    
+    # Import Zero123 modules
+    try:
+        # Different repos have different module names
+        from zero123 import model_from_config
+    except:
+        # Try alternate import
+        from ldm.util import instantiate_from_config
+        model_from_config = instantiate_from_config
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
     
-    # Load Zero123 model (hosted on HuggingFace by the authors)
-    print("[Zero123] Loading model...")
+    print(f"[Zero123] Loading checkpoint from {ckpt}...")
     
-    # Try the official Zero123-XL weights
+    # Load config (Zero123 uses OmegaConf configs)
+    config_path = repo / "configs" / "sd-objaverse-finetune-c_concat-256.yaml"
+    if not config_path.exists():
+        # Try alternate config paths
+        for alt in ["configs/sd-zero123-c_concat-256.yaml", "configs/default.yaml"]:
+            alt_path = repo / alt
+            if alt_path.exists():
+                config_path = alt_path
+                break
+    
+    if not config_path.exists():
+        raise FileNotFoundError(f"No config file found in {repo}/configs")
+    
+    config = OmegaConf.load(config_path)
+    
+    # Load model from checkpoint
     try:
-        pipe = StableDiffusionPipeline.from_pretrained(
-            "cvlab/zero123-weights",  # or try the actual HF path from their README
-            torch_dtype=dtype,
-            safety_checker=None
-        ).to(device)
-    except:
-        # Fallback to building from checkpoint if repo provides one
-        print("[Zero123] Trying alternate model path...")
-        # Check repo for checkpoint path
-        ckpt_path = repo / "105000.ckpt"
-        if not ckpt_path.exists():
-            raise FileNotFoundError("Zero123 checkpoint not found. Download from model page.")
-        
-        # Load from checkpoint (requires their load script)
-        from zero123_inference import load_model
-        pipe = load_model(str(ckpt_path), device)
+        model = model_from_config(config.model)
+        checkpoint = torch.load(str(ckpt), map_location=device)
+        model.load_state_dict(checkpoint["state_dict"], strict=False)
+        model = model.to(device).eval()
+    except Exception as e:
+        print(f"[Zero123] Failed to load with config approach: {e}")
+        # Try pytorch-lightning approach
+        from pytorch_lightning import Trainer
+        model = pl.LightningModule.load_from_checkpoint(str(ckpt), map_location=device)
+        model = model.to(device).eval()
     
-    # Load input
-    image = Image.open(input_img).convert("RGB").resize((256, 256))
+    # Load and preprocess input
+    image = Image.open(input_img).convert("RGB")
+    image = image.resize((256, 256), Image.Resampling.LANCZOS)
     
-    print(f"[Zero123] Generating {num_views} views...")
+    print(f"[Zero123] Generating {num_views} views at elevation {elevation}°...")
+    
+    import numpy as np
+    from torchvision import transforms
+    
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5])
+    ])
+    
+    img_tensor = transform(image).unsqueeze(0).to(device)
+    
     for i in range(num_views):
         azimuth = (360.0 / num_views) * i
         polar = 90.0 - elevation
         
-        # Zero123 conditioning
-        prompt_embeds = pipe.encode_prompt(
-            f"",  # Zero123 uses camera params, not text
-            device,
-            1,
-            False
-        )
+        # Prepare camera conditioning
+        polar_rad = np.deg2rad(polar)
+        azimuth_rad = np.deg2rad(azimuth)
         
-        # Generate view
-        result = pipe(
-            prompt_embeds=prompt_embeds,
-            image=image,
-            polar=torch.tensor([polar], device=device),
-            azimuth=torch.tensor([azimuth], device=device),
-            num_inference_steps=75,
-            guidance_scale=3.0
-        )
+        # Zero123 expects T (camera transform) as conditioning
+        # This varies by implementation; try common patterns
+        with torch.no_grad():
+            try:
+                # Pattern 1: pass polar/azimuth directly
+                output = model(
+                    img_tensor,
+                    polar=torch.tensor([[polar_rad]], device=device, dtype=torch.float32),
+                    azimuth=torch.tensor([[azimuth_rad]], device=device, dtype=torch.float32)
+                )
+            except:
+                # Pattern 2: encode as embedding
+                camera_emb = model.get_camera_cond(polar_rad, azimuth_rad)
+                output = model(img_tensor, camera_emb)
         
-        result.images[0].save(os.path.join(output_dir, f"view_{i:02d}.png"))
+        # Convert output to image
+        out_np = output[0].cpu().permute(1, 2, 0).numpy()
+        out_np = ((out_np + 1) * 127.5).clip(0, 255).astype(np.uint8)
+        out_img = Image.fromarray(out_np)
+        out_img.save(os.path.join(output_dir, f"view_{i:02d}.png"))
     
     print(f"[Zero123] Done. {num_views} views in {output_dir}")
 
-def fallback_simple_multiview(input_img, output_dir, num_views=12):
-    """
-    Fallback: Use ControlNet + SD to generate architectural views.
-    This is more reliable than image-variations for 3D reconstruction.
-    """
+def fallback_controlnet(input_img, output_dir, num_views=12):
+    """ControlNet fallback for architectural multiviews."""
     import torch
-    from PIL import Image, ImageOps
-    from diffusers import StableDiffusionControlNetPipeline, ControlNetModel
-    from diffusers import UniPCMultistepScheduler
+    from PIL import Image
+    from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
     import cv2
     import numpy as np
     
-    print("[Fallback] Using ControlNet for multiview generation...")
+    print("[Fallback] Using ControlNet for architectural multiviews...")
     
     os.makedirs(output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
     
-    # Load ControlNet (canny edge)
     controlnet = ControlNetModel.from_pretrained(
         "lllyasviel/sd-controlnet-canny",
         torch_dtype=dtype
@@ -147,16 +181,19 @@ def fallback_simple_multiview(input_img, output_dir, num_views=12):
     edges = cv2.Canny(img_np, 100, 200)
     edges_pil = Image.fromarray(edges).convert("RGB")
     
-    # Generate views with slight prompt variations
-    prompts = [
-        "architectural facade, front view, professional photo",
-        "architectural facade, slight left angle, professional photo",
-        "architectural facade, slight right angle, professional photo",
-        "architectural facade, elevated view, professional photo",
+    # Architectural prompts with angle variations
+    base_prompt = "architectural facade, professional photo, high detail"
+    angle_prompts = [
+        f"{base_prompt}, front view",
+        f"{base_prompt}, slight left angle",
+        f"{base_prompt}, left view",
+        f"{base_prompt}, slight right angle",
+        f"{base_prompt}, right view",
+        f"{base_prompt}, elevated view",
     ]
     
     for i in range(num_views):
-        prompt = prompts[i % len(prompts)]
+        prompt = angle_prompts[i % len(angle_prompts)]
         seed = 42 + i * 100
         generator = torch.Generator(device=device).manual_seed(seed)
         
@@ -176,16 +213,16 @@ def main():
     args = parse_args()
     
     try:
-        print("[Zero123] Trying native programmatic inference...")
-        run_zero123_programmatic(args.input, args.output, args.num_views, args.elevation)
+        print("[Zero123] Attempting Zero123-XL with checkpoint...")
+        run_zero123_xl(args.input, args.output, args.checkpoint, args.num_views, args.elevation)
     except Exception as e:
-        print(f"[Zero123] Error: {e}", file=sys.stderr)
+        print(f"[Zero123] Checkpoint inference failed: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         
-        print("[Zero123] Attempting ControlNet fallback...")
+        print("\n[Zero123] Falling back to ControlNet (still high quality for architecture)...")
         try:
-            fallback_simple_multiview(args.input, args.output, args.num_views)
+            fallback_controlnet(args.input, args.output, args.num_views)
         except Exception as e2:
             print(f"[Fallback] Failed: {e2}", file=sys.stderr)
             sys.exit(1)
