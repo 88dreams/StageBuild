@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -e
-source /workspace/.venv/bin/activate
+# Activate venv only if it exists
+[ -d /workspace/.venv ] && source /workspace/.venv/bin/activate || true
 if [ $# -gt 0 ]; then
   exec "$@"
 else
